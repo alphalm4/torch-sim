@@ -159,12 +159,12 @@ def pbc_wrap_batched(
 
     # Efficient approach without explicit loops
     # Get the cell for each atom based on its system index
-    B = torch.linalg.inv(cell)  # Shape: (n_systems, 3, 3)
+    B = torch.linalg.inv(cell.double())  # Shape: (n_systems, 3, 3)
     B_per_atom = B[system_idx]  # Shape: (n_atoms, 3, 3)
 
     # Transform to fractional coordinates: f = B·r
     # For each atom, multiply its position by its system's inverse cell matrix
-    frac_coords = torch.bmm(B_per_atom, positions.unsqueeze(2)).squeeze(2)
+    frac_coords = torch.bmm(B_per_atom, positions.double().unsqueeze(2)).squeeze(2)
 
     # Wrap to reference cell [0,1) using modulo
     wrapped_frac = frac_coords.clone()
@@ -172,10 +172,10 @@ def pbc_wrap_batched(
 
     # Transform back to real space: r = A·f
     # Get the cell for each atom based on its system index
-    cell_per_atom = cell[system_idx]  # Shape: (n_atoms, 3, 3)
+    cell_per_atom = cell.double()[system_idx]  # Shape: (n_atoms, 3, 3)
 
     # For each atom, multiply its wrapped fractional coords by its system's cell matrix
-    return torch.bmm(cell_per_atom, wrapped_frac.unsqueeze(2)).squeeze(2)
+    return torch.bmm(cell_per_atom, wrapped_frac.unsqueeze(2)).squeeze(2).to(positions.dtype)
 
 
 def minimum_image_displacement(
