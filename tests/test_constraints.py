@@ -9,6 +9,7 @@ from torch_sim.constraints import (
     Constraint,
     FixAtoms,
     FixCom,
+    FixInternals,
     FixSymmetry,
     count_degrees_of_freedom,
     merge_constraints,
@@ -1273,3 +1274,242 @@ class TestConstraintToDeviceDtype:
         # original constraint unchanged
         orig = state.constraints[0]
         assert orig.rotations[0].dtype == torch.float64
+
+
+# ---------------------------------------------------------------------------
+# FixInternals tests
+# ---------------------------------------------------------------------------
+
+
+def _make_4atom_state(dtype=DTYPE) -> ts.SimState:
+    """Create a 4-atom state for internal coordinate tests."""
+    positions = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.5, 1.0, 0.0],
+            [2.5, 1.0, 0.5],
+        ],
+        dtype=dtype,
+    )
+    return ts.SimState(
+        positions=positions,
+        masses=torch.ones(4, dtype=dtype),
+        cell=(torch.eye(3, dtype=dtype) * 10.0).unsqueeze(0),
+        pbc=False,
+        atomic_numbers=torch.tensor([1, 1, 1, 1]),
+        system_idx=torch.zeros(4, dtype=torch.long),
+    )
+
+
+def test_fix_internals_bond_constraint():
+    """Test that FixInternals preserves a bond length after position perturbation."""
+    from torch_sim.geometry import conditional_find_mic
+
+    state = _make_4atom_state()
+    constraint = FixInternals.from_definitions(state, bonds=[(None, [0, 1])])
+    target = constraint.bond_targets[0].item()
+    state.constraints = [constraint]
+
+    new_pos = state.positions.clone()
+    new_pos[1, 0] += 0.3  # perturb
+    state.set_constrained_positions(new_pos)
+
+    v = state.positions[1] - state.positions[0]
+    dist = torch.linalg.norm(v).item()
+    assert abs(dist - target) < 1e-6, f"Bond {dist} != target {target}"
+
+
+def test_fix_internals_angle_constraint():
+    """Test that FixInternals preserves an angle after position perturbation."""
+    from torch_sim.geometry import get_angles
+
+    state = _make_4atom_state()
+    constraint = FixInternals.from_definitions(
+        state, angles_deg=[(None, [0, 1, 2])]
+    )
+    target = constraint.angle_targets[0].item()
+    state.constraints = [constraint]
+
+    new_pos = state.positions.clone()
+    new_pos[2] += torch.tensor([0.2, -0.1, 0.0], dtype=DTYPE)
+    state.set_constrained_positions(new_pos)
+
+    v0 = state.positions[0] - state.positions[1]
+    v1 = state.positions[2] - state.positions[1]
+    angle = get_angles(v0.unsqueeze(0), v1.unsqueeze(0)).item()
+    assert abs(angle - target) < 1e-5, f"Angle {angle} != target {target}"
+
+
+def test_fix_internals_dihedral_constraint():
+    """Test that FixInternals preserves a dihedral angle."""
+    from torch_sim.geometry import get_dihedrals
+
+    state = _make_4atom_state()
+    constraint = FixInternals.from_definitions(
+        state, dihedrals_deg=[(None, [0, 1, 2, 3])]
+    )
+    target = constraint.dihedral_targets[0].item()
+    state.constraints = [constraint]
+
+    new_pos = state.positions.clone()
+    new_pos[3] += torch.tensor([0.0, 0.0, 0.3], dtype=DTYPE)
+    state.set_constrained_positions(new_pos)
+
+    v0 = state.positions[1] - state.positions[0]
+    v1 = state.positions[2] - state.positions[1]
+    v2 = state.positions[3] - state.positions[2]
+    dih = get_dihedrals(v0.unsqueeze(0), v1.unsqueeze(0), v2.unsqueeze(0)).item()
+    # minimum dihedral difference
+    diff = (dih - target + 180) % 360 - 180
+    assert abs(diff) < 1e-4, f"Dihedral {dih} != target {target}"
+
+
+def test_fix_internals_bondcombo_constraint():
+    """Test that FixInternals preserves a linear combination of bond lengths."""
+    state = _make_4atom_state()
+    # combo: 1.0 * d(0,1) + (-1.0) * d(2,3)
+    constraint = FixInternals.from_definitions(
+        state, bondcombos=[(None, [[0, 1, 1.0], [2, 3, -1.0]])]
+    )
+    target = constraint.combo_targets[0].item()
+    state.constraints = [constraint]
+
+    new_pos = state.positions.clone()
+    new_pos[1, 0] += 0.2
+    new_pos[3, 0] -= 0.1
+    state.set_constrained_positions(new_pos)
+
+    d01 = torch.linalg.norm(state.positions[1] - state.positions[0]).item()
+    d23 = torch.linalg.norm(state.positions[3] - state.positions[2]).item()
+    combo_val = 1.0 * d01 + (-1.0) * d23
+    assert abs(combo_val - target) < 1e-5, f"Combo {combo_val} != target {target}"
+
+
+def test_fix_internals_multiple_constraints():
+    """Test fixing bond + angle simultaneously."""
+    from torch_sim.geometry import get_angles
+
+    state = _make_4atom_state()
+    constraint = FixInternals.from_definitions(
+        state,
+        bonds=[(None, [0, 1])],
+        angles_deg=[(None, [0, 1, 2])],
+    )
+    state.constraints = [constraint]
+    bond_target = constraint.bond_targets[0].item()
+    angle_target = constraint.angle_targets[0].item()
+
+    new_pos = state.positions.clone()
+    new_pos[1] += torch.tensor([0.15, 0.1, 0.0], dtype=DTYPE)
+    new_pos[2] += torch.tensor([0.1, -0.1, 0.0], dtype=DTYPE)
+    state.set_constrained_positions(new_pos)
+
+    dist = torch.linalg.norm(state.positions[1] - state.positions[0]).item()
+    v0 = state.positions[0] - state.positions[1]
+    v1 = state.positions[2] - state.positions[1]
+    angle = get_angles(v0.unsqueeze(0), v1.unsqueeze(0)).item()
+
+    assert abs(dist - bond_target) < 1e-5
+    assert abs(angle - angle_target) < 1e-4
+
+
+def test_fix_internals_dof_counting():
+    """Test DOF removal: 1 per constraint."""
+    state = _make_4atom_state()
+    constraint = FixInternals.from_definitions(
+        state,
+        bonds=[(1.0, [0, 1])],
+        angles_deg=[(90.0, [0, 1, 2])],
+        dihedrals_deg=[(120.0, [0, 1, 2, 3])],
+    )
+    dof = constraint.get_removed_dof(state)
+    assert dof.item() == 3  # 1 bond + 1 angle + 1 dihedral
+
+
+def test_fix_internals_force_projection():
+    """Test that force projection removes constraint-direction components."""
+    state = _make_4atom_state()
+    constraint = FixInternals.from_definitions(state, bonds=[(None, [0, 1])])
+    state.constraints = [constraint]
+
+    forces = torch.randn(4, 3, dtype=DTYPE)
+    original_norm = forces.norm().item()
+    constraint.adjust_forces(state, forces)
+    projected_norm = forces.norm().item()
+    # Forces should be reduced (or equal if already in constraint manifold)
+    assert projected_norm <= original_norm + 1e-10
+
+
+def test_fix_internals_state_manipulation():
+    """Test select/reindex/merge for FixInternals through state split/concat."""
+    s1 = _make_4atom_state()
+    s2 = _make_4atom_state()
+
+    c1 = FixInternals.from_definitions(s1, bonds=[(1.0, [0, 1])])
+    c2 = FixInternals.from_definitions(s2, dihedrals_deg=[(120.0, [0, 1, 2, 3])])
+
+    s1.constraints = [c1]
+    s2.constraints = [c2]
+
+    # Concatenate
+    combined = ts.concatenate_states([s1, s2])
+    assert len(combined.constraints) == 1
+    combined_c = combined.constraints[0]
+    assert isinstance(combined_c, FixInternals)
+    assert len(combined_c.system_idx) == 2
+
+    # Bond indices for system 0 should be unchanged
+    assert combined_c.bond_indices[0].tolist() == [[0, 1]]
+    # Dihedral indices for system 1 should be offset by 4
+    assert combined_c.dihedral_indices[1].tolist() == [[4, 5, 6, 7]]
+
+    # Split back
+    splits = combined.split()
+    assert len(splits[0].constraints) == 1
+    assert len(splits[1].constraints) == 1
+    # System 0 should have bond constraint
+    sc0 = splits[0].constraints[0]
+    assert isinstance(sc0, FixInternals)
+    assert sc0.bond_indices[0].tolist() == [[0, 1]]
+    # System 1 should have dihedral constraint
+    sc1 = splits[1].constraints[0]
+    assert isinstance(sc1, FixInternals)
+    assert sc1.dihedral_indices[0].tolist() == [[0, 1, 2, 3]]
+
+
+def test_fix_internals_to_device_dtype():
+    """Test that .to() moves tensors correctly."""
+    state = _make_4atom_state(dtype=torch.float64)
+    constraint = FixInternals.from_definitions(
+        state,
+        bonds=[(1.0, [0, 1])],
+        angles_deg=[(90.0, [0, 1, 2])],
+    )
+    moved = constraint.to(dtype=torch.float32)
+    assert moved.bond_targets[0].dtype == torch.float32
+    assert moved.angle_targets[0].dtype == torch.float32
+    assert moved.bond_indices[0].dtype == torch.long  # indices stay long
+
+
+def test_fix_internals_merge_rejects_empty():
+    """FixInternals.merge raises on empty input."""
+    with pytest.raises(ValueError, match="requires at least one"):
+        FixInternals.merge([])
+
+
+def test_fix_internals_convergence_failure():
+    """Test that non-convergence raises ValueError."""
+    state = _make_4atom_state()
+    # Create a constraint with an impossible target (angle = 0 degrees)
+    constraint = FixInternals(
+        torch.tensor([0]),
+        angle_indices=[torch.tensor([[0, 1, 2]])],
+        angle_targets=[torch.tensor([0.1])],  # near-planar, hard to satisfy
+        epsilon=1e-15,  # extremely tight tolerance
+    )
+    state.constraints = [constraint]
+    new_pos = state.positions.clone()
+    new_pos[2] += torch.tensor([0.5, 0.5, 0.5], dtype=DTYPE)
+    with pytest.raises(ValueError, match="did not converge"):
+        state.set_constrained_positions(new_pos)
